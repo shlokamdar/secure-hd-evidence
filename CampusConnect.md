@@ -12,6 +12,7 @@ This document tracks the vulnerabilities demonstrated in `vulnerable-webapp`, on
 
 - [6.3 — Stored XSS (Club Noticeboard)](#63--stored-xss-club-noticeboard)
 - [6.4 — SQL Injection (Member Search)](#64--sql-injection-member-search)
+- [6.5 — CSRF (Send Study Points)](#65--csrf-send-study-points)
 
 ---
 
@@ -191,13 +192,82 @@ Replace the native concatenated query with Hibernate ORM's parameterized derived
 
 ---
 
+## 6.5 — CSRF (Send Study Points)
+
+### Objective
+Demonstrate a Cross-Site Request Forgery vulnerability in the "Send Study Points" feature.
+
+### Location
+| | |
+|---|---|
+| Vulnerable code | `src/main/java/com/campusconnect/controller/StudyPointsController.java`, `send()` method (`POST /study-points/send`) |
+| Attacker artifact | `csrf-attack/attacker.html` (hosted separately, simulating a malicious third-party site) |
+
+### Vulnerable code
+
+```java
+// VULNERABLE: no CSRF token, no origin/referrer check.
+// Relies purely on the session cookie automatically sent by the browser.
+@PostMapping("/send")
+public String send(@RequestParam String toUsername,
+                    @RequestParam int amount,
+                    HttpSession session) {
+    String currentUser = (String) session.getAttribute("currentUser");
+    if (currentUser == null) {
+        return "redirect:/login";
+    }
+    studyPointService.sendPoints(currentUser, toUsername, amount);
+    return "redirect:/study-points";
+}
+```
+
+### Why vulnerable
+The endpoint authorizes a state-changing action (a point transfer) based purely on the presence of a valid session cookie. There is no CSRF token binding the request to a legitimate form render, and no verification of the `Origin`/`Referer` header. Any page the victim's browser visits — while their CampusConnect session remains active — can silently trigger this same request.
+
+### Attack scenario
+1. Victim logs into CampusConnect normally (session cookie established)
+2. Without logging out, victim visits an attacker-controlled page
+3. That page contains a hidden, auto-submitting form targeting `/study-points/send`
+4. Browser automatically attaches the victim's session cookie to the forged request
+5. CampusConnect cannot distinguish this from a legitimate request
+
+### Expected vs. actual result
+| | |
+|---|---|
+| **Expected (secure) behaviour** | Request rejected — no valid CSRF token / origin mismatch |
+| **Actual (vulnerable) result** | Victim's balance dropped from 40 to -460 points; an unauthorized `carla_nguyen → bob_smith: 500 points` transaction appeared in the log, despite Carla never clicking "Send Points" on the real form — she only clicked a "Claim Your Prize!" button on an unrelated page at `localhost:9000`. Confirmed via browser DevTools: the forged `POST /vulnerable-webapp/study-points/send` request, originating from the attacker page, returned `302` and was processed identically to a legitimate request. |
+
+### Security impact
+An attacker can transfer study points out of any logged-in victim's account without their knowledge or consent, simply by getting them to visit a page (or click something innocuous-looking on it) while their CampusConnect session is active — no phishing of credentials required, since the victim never interacts with CampusConnect directly during the attack.
+
+> **Secondary observation (not the focus of this vulnerability, worth a brief mention):** the app also has no validation preventing a transfer from driving a sender's balance negative — Carla's balance reached -460 with no rejection. A minor input-validation gap alongside the main CSRF issue.
+
+### Evidence
+
+| Screenshot | Description |
+|---|---|
+| ![Login dropdown](T1-03a_studypoints_login.png) | `T1-03a` — "Act as" login dropdown, no password required |
+| ![Baseline](T1-03b_studypoints_baseline.png) | `T1-03b` — Study points page after logging in as Carla (40 points, no transactions) |
+| ![Normal transfer](T1-03c_studypoints_normal_transfer.png) | `T1-03c` — Legitimate transfer of 10 points to Alice, balance and transaction updating correctly |
+| ![Attacker page](T1-03d_csrf_attacker_page.png) | `T1-03d` — Disguised "Free Giveaway" attacker page at `localhost:9000`, hosted on a different origin |
+| ![Victim before](T1-03e_csrf_victim_before.png) | `T1-03e` — Carla's balance immediately before visiting the attacker page |
+| ![Victim after](T1-03f_csrf_victim_after.png) | `T1-03f` — Carla's balance after clicking the disguised button — unauthorized 500-point transfer to `bob_smith`, balance now -460 |
+| ![Network evidence](T1-03g_csrf_network_evidence.png) | `T1-03g` — Browser DevTools Network tab showing the forged cross-origin `POST /study-points/send` succeeding with a `302` response |
+| ![Vulnerable controller](T1-03h_csrf_vulnerable_controller.png) | `T1-03h` — Source: `StudyPointsController.java`, `/send` endpoint with no CSRF token or origin check |
+| ![Attacker source](T1-03i_csrf_attacker_html_source.png) | `T1-03i` — Source: `attacker.html`, the hidden auto-fillable form and disguised trigger button |
+
+### Planned prevention (Task 3)
+Per the brief: CSRF token-based protection combined with the `HttpSession` ID (`JSESSIONID`), plus Referrer header validation — explicitly **not** Spring Security's built-in CSRF protection, which is reserved for Task 4.
+
+---
+
 ## Evidence Checklist (Task 1)
 
 | ID | Vulnerability | Vulnerable code demonstrated | Attack demonstrated | Source location documented | Status |
 |---|---|---|---|---|---|
 | T1-01 | Stored XSS | ✅ | ✅ | ✅ | Complete |
 | T1-02 | SQL Injection | ✅ | ✅ | ✅ | Complete |
-| T1-03 | CSRF | ⬜ | ⬜ | ⬜ | Pending |
+| T1-03 | CSRF | ✅ | ✅ | ✅ | Complete |
 | T1-04 | Data Aggregation | ⬜ | ⬜ | ⬜ | Pending |
 | T1-05 | Unrestricted File Upload | ⬜ | ⬜ | ⬜ | Pending |
 | T1-06 | SSRF (SIT738) | ⬜ | ⬜ | ⬜ | Pending |
