@@ -260,7 +260,91 @@ An attacker can transfer study points out of any logged-in victim's account with
 Per the brief: CSRF token-based protection combined with the `HttpSession` ID (`JSESSIONID`), plus Referrer header validation — explicitly **not** Spring Security's built-in CSRF protection, which is reserved for Task 4.
 
 ---
+## 4 — Data Aggregation / Broken Access Control (Member Profile)
 
+### Objective
+Demonstrate an Insecure Direct Object Reference (IDOR) combined with excessive data exposure in the Member Profile feature.
+
+### Location
+| | |
+|---|---|
+| Vulnerable code | `src/main/resources/templates/profile/view.html` (lines ~27–37, unconditional field rendering) |
+| Entry point | `src/main/java/com/campusconnect/controller/ProfileController.java`, `viewProfile()` |
+
+### Vulnerable code
+
+```java
+@GetMapping("/profile")
+public String viewProfile(@RequestParam Long id, Model model) {
+    Member member = memberRepository.findById(id).orElse(null);
+    model.addAttribute("member", member);
+    model.addAttribute("requestedId", id);
+    return "profile/view";
+}
+```
+
+```html
+<!-- VULNERABLE: exposes every field on the entity, including
+     internal/sensitive data no "public profile" view should show -->
+<div th:if="${member != null}" class="post">
+    <p><strong>ID:</strong> <span th:text="${member.id}"></span></p>
+    <p><strong>Username:</strong> <span th:text="${member.username}"></span></p>
+    <p><strong>Full name:</strong> <span th:text="${member.fullName}"></span></p>
+    <p><strong>Email:</strong> <span th:text="${member.email}"></span></p>
+    <p><strong>Phone:</strong> <span th:text="${member.phone} ?: 'Not provided'"></span></p>
+    <p><strong>Role:</strong> <span th:text="${member.role}"></span></p>
+    <p><strong>Study Points:</strong> <span th:text="${member.studyPoints}"></span></p>
+    <p><strong>Password Hash:</strong> <span th:text="${member.passwordHash}"></span></p>
+</div>
+```
+
+### Why vulnerable
+- `viewProfile()` takes an arbitrary `id` request parameter and passes it straight to `memberRepository.findById(id)` with **no authentication check and no ownership/authorization check** — there is no verification that a session exists, let alone that the requester is entitled to view that particular record.
+- The template renders **every field** on the `Member` entity unconditionally, including internal/sensitive data — role, exact study point balance, and even the **password hash** — that a "public profile" view has no legitimate reason to expose to anyone, owner or not.
+- Together this is a textbook **IDOR** (OWASP A01:2021 — Broken Access Control) layered with **excessive data exposure**: even a properly authenticated, ordinary member could walk the `id` parameter and pull every other member's private data with no injection or exploit technique required at all — just incrementing a number in the URL.
+
+### Attack input
+| Parameter | Values used |
+|---|---|
+| `id` | `1`, `2`, `3`, `4`, `5` (all seeded members, no session/login) |
+
+### Attack procedure
+1. Visit `GET /vulnerable-webapp/profile?id=1` with **no login** — full record for `alice_wong` returned, including password hash, role, and study points.
+2. Manually increment `id` through `2`–`5` — each request returns a different member's complete record, unauthenticated.
+3. Automate the walk with a bash loop piping each response through `curl` and `grep`, extracting the `Password Hash` field for all five members in a single unauthenticated pass — demonstrating trivial bulk harvesting rather than a one-off manual look.
+
+```bash
+for id in 1 2 3 4 5; do
+  echo "--- Member ID $id ---"
+  curl -s "http://localhost:8080/vulnerable-webapp/profile?id=$id" | grep -A1 "Password Hash"
+done
+```
+
+### Expected vs. actual result
+| | |
+|---|---|
+| **Expected (secure) behaviour** | Profile only accessible to the authenticated owner (or an ADMIN), with sensitive fields (password hash, role, exact points) hidden from the rendered view entirely |
+| **Actual (vulnerable) result** | Any anonymous visitor can view any member's full record — including password hash, role, and exact study point balance — for all 5 seeded IDs, with zero authentication |
+
+### Security impact
+An attacker can enumerate the entire member table from an unauthenticated position, harvesting password hashes (enabling offline cracking or credential-stuffing attempts), roles (identifying which accounts are ADMIN and therefore high-value targets), and exact point balances (a business-logic-sensitive value). Combined with simple sequential-ID enumeration, this amounts to a full, unauthenticated data dump of the member table — functionally similar in outcome to the SQL Injection vulnerability in Feature 2, but requiring no injection technique at all, only incrementing a URL parameter.
+
+### Evidence
+
+| Screenshot | Description |
+|---|---|
+| ![Normal view](T1-04a_profile_normal_view.png) | `T1-04a` — Baseline profile view confirming the feature renders correctly |
+| ![ID 1 — Alice](T1-04b_profile_id1_alice.png) | `T1-04b` — `id=1`, unauthenticated, full record for `alice_wong` (ADMIN) including password hash |
+| ![ID 2 — Bob](T1-04c_profile_id2_bob.png) | `T1-04c` — `id=2`, `bob_smith` (CLUB_LEADER) record returned by simply changing the URL |
+| ![ID 3 — Carla](T1-04d_profile_id3_carla.png) | `T1-04d` — `id=3`, `carla_nguyen` record, including her (negative) study point balance |
+| ![ID 4 — David](T1-04e_profile_id4_david.png) | `T1-04e` — `id=4`, `david_patel` record, confirming the NULL-phone edge case still renders (`Not provided`) |
+| ![ID 5 — Admin](T1-04f_profile_id5_admin.png) | `T1-04f` — `id=5`, `admin` (ADMIN) record fully exposed |
+| ![Curl automation](T1-04h_aggregation_curl_automation.png) | `T1-04h` — Bash/curl loop extracting all 5 password hashes unauthenticated in a single automated pass |
+| ![Vulnerable controller](T1-04i_vulnerable_controller.png) | `T1-04i` — Source: `ProfileController.java`, `viewProfile()` showing no auth/ownership check |
+| ![Vulnerable template](T1-04j_vulnerable_template.png) | `T1-04j` — Source: `view.html`, unconditional field rendering including `passwordHash` |
+
+### Planned prevention (Task 3)
+Add a server-side ownership/role check (requested `id` must match the session's `currentUser`, or the session role must be `ADMIN`); replace sequential numeric IDs with non-guessable identifiers (UUIDs) or an indirect reference map; and restrict the fields rendered to a "public profile" DTO/projection that excludes `passwordHash`, `role`, and exact `studyPoints` for non-owner viewers.
 ## Evidence Checklist (Task 1)
 
 | ID | Vulnerability | Vulnerable code demonstrated | Attack demonstrated | Source location documented | Status |
@@ -268,6 +352,6 @@ Per the brief: CSRF token-based protection combined with the `HttpSession` ID (`
 | T1-01 | Stored XSS | ✅ | ✅ | ✅ | Complete |
 | T1-02 | SQL Injection | ✅ | ✅ | ✅ | Complete |
 | T1-03 | CSRF | ✅ | ✅ | ✅ | Complete |
-| T1-04 | Data Aggregation | ⬜ | ⬜ | ⬜ | Pending |
+| T1-04 | Data Aggregation | ✅ | ✅ | ✅ | Pending |
 | T1-05 | Unrestricted File Upload | ⬜ | ⬜ | ⬜ | Pending |
 | T1-06 | SSRF (SIT738) | ⬜ | ⬜ | ⬜ | Pending |
