@@ -13,6 +13,8 @@ This document tracks the vulnerabilities demonstrated in `vulnerable-webapp`, on
 - [6.3 — Stored XSS (Club Noticeboard)](#63--stored-xss-club-noticeboard)
 - [6.4 — SQL Injection (Member Search)](#64--sql-injection-member-search)
 - [6.5 — CSRF (Send Study Points)](#65--csrf-send-study-points)
+- [4 — Data Aggregation / Broken Access Control (Member Profile)](#4--data-aggregation--broken-access-control-member-profile)
+- [6.6 — Unrestricted File Upload (Photo Upload)](#66--unrestricted-file-upload-photo-upload)
 
 ---
 
@@ -345,6 +347,173 @@ An attacker can enumerate the entire member table from an unauthenticated positi
 
 ### Planned prevention (Task 3)
 Add a server-side ownership/role check (requested `id` must match the session's `currentUser`, or the session role must be `ADMIN`); replace sequential numeric IDs with non-guessable identifiers (UUIDs) or an indirect reference map; and restrict the fields rendered to a "public profile" DTO/projection that excludes `passwordHash`, `role`, and exact `studyPoints` for non-owner viewers.
+---
+
+## 6.6 — Unrestricted File Upload (Photo Upload)
+
+### Objective
+Demonstrate an unrestricted file upload vulnerability in the profile photo / event flyer upload feature, leading to remote code execution.
+
+### Location
+| | |
+|---|---|
+| Vulnerable code | `src/main/java/com/campusconnect/controller/UploadController.java`, `handleUpload()` |
+| Entry point | `src/main/resources/templates/upload/index.html`, upload form |
+
+### Vulnerable code
+
+```java
+@Controller
+public class UploadController {
+
+    private static final String UPLOAD_DIR =
+            "/home/kali/SIT218/eclipse-workspace/vulnerable-webapp/target/vulnerable-webapp/uploads/";
+
+    @GetMapping("/upload")
+    public String uploadForm(Model model) {
+        File dir = new File(UPLOAD_DIR);
+        String[] files = dir.exists() ? dir.list() : new String[0];
+        model.addAttribute("files", files);
+        return "upload/index";
+    }
+
+    @PostMapping("/upload")
+    public String handleUpload(@RequestParam("file") MultipartFile file, Model model) throws IOException {
+        if (!file.isEmpty()) {
+            File dir = new File(UPLOAD_DIR);
+            if (!dir.exists()) dir.mkdirs();
+
+            Path filePath = Paths.get(UPLOAD_DIR, file.getOriginalFilename());
+            file.transferTo(filePath);
+        }
+        return "redirect:/upload";
+    }
+}
+```
+
+```html
+<form th:action="@{/upload}" method="post" enctype="multipart/form-data">
+    <label>Choose file</label>
+    <input type="file" name="file">
+    <button type="submit">Upload</button>
+</form>
+```
+
+### Why vulnerable
+- `handleUpload()` performs **no validation whatsoever** on the uploaded file: no extension allow-list, no MIME/content-type check, and no inspection of the actual file bytes (magic-number sniffing) to confirm it is really an image.
+- `file.getOriginalFilename()` — a value fully controlled by the attacker's browser — is passed straight into `Paths.get()` and used as the on-disk filename with no sanitization. This is a secondary weakness (path traversal via `../` sequences in the filename) sitting alongside the primary one, though not the technique demonstrated below.
+- Critically, `UPLOAD_DIR` points **inside the deployed Tomcat webapp directory** (`target/vulnerable-webapp/uploads/`) — a location the servlet container actively serves and, because it ends in `.jsp`, will **compile and execute** rather than just return as a static file. Storing uploads inside a JSP-servable path is what turns "arbitrary file upload" into "arbitrary code execution."
+- The HTML form has no `accept` attribute either, but that's a client-side nicety the attacker simply ignores — the real gap is server-side.
+
+### Attack input
+`proof.jsp`, uploaded in place of an image:
+```jsp
+<html>
+<body>
+<h2>Unrestricted File Upload — Proof of Concept</h2>
+<p>This is a JSP file, not an image, and it was accepted and executed by the server.</p>
+<p>Server info: <%= application.getServerInfo() %></p>
+<p>Current date on server: <%= new java.util.Date() %></p>
+</body>
+</html>
+```
+
+### Attack procedure
+1. Confirm normal functionality first: upload a legitimate `.jpg` (`aaron-burden-...jpg`) — it's accepted, listed under "Uploaded Files," and renders correctly at `/vulnerable-webapp/uploads/aaron-burden-...jpg`.
+2. Select `proof.jsp` in the same upload form instead of an image file. Nothing in the client or server rejects it.
+3. Submit. `proof.jsp` is accepted and appears in the "Uploaded Files" list right alongside the legitimate image — server-side, it was treated identically to the `.jpg`.
+4. Navigate directly to `http://localhost:8080/vulnerable-webapp/uploads/proof.jsp`. Rather than downloading the file or returning an error, Tomcat **compiles and executes** it as a JSP page, and the scriptlet output (`application.getServerInfo()`, live server date) renders in the browser — proof the server ran attacker-supplied Java code, not just stored an attacker-supplied file.
+
+### Expected vs. actual result
+| | |
+|---|---|
+| **Expected (secure) behaviour** | Upload rejected (wrong extension/content-type/magic bytes), or if accepted, stored outside any JSP-servable path with a server-generated filename so it can never be requested as executable code |
+| **Actual (vulnerable) result** | `proof.jsp` accepted with no checks, saved under its original filename inside the live webapp deployment directory, and executed on request — full server-side script execution, evidenced by `Server info: Apache Tomcat/10.1.59` and the live server date being printed back |
+
+### Security impact
+This is the most severe vulnerability demonstrated so far: **remote code execution**, not just data exposure or session abuse. `proof.jsp` only prints diagnostic text, but nothing stops a real attacker from embedding `Runtime.getRuntime().exec(...)` (or a full JSP web shell) in the scriptlet — giving them arbitrary command execution with whatever OS privileges the Tomcat process runs as. From there, an attacker could read the filesystem (including the app's DB credentials in configuration), pivot into `campusconnect_db` directly, plant a persistent backdoor, or use the box as a foothold into the rest of the network. Where SQLi and Data Aggregation exposed the database and CSRF/XSS abused a victim's session, this vulnerability hands over the **server itself**.
+
+### Evidence
+
+| Screenshot | Description |
+|---|---|
+| ![Baseline](T1-05a_upload_baseline.png) | `T1-05a` — Upload page baseline, no files uploaded yet |
+| ![Normal upload](T1-05b_upload_normal_image.png) | `T1-05b` — Legitimate `.jpg` uploaded successfully, proving normal functionality |
+| ![Normal image fetched](T1-05c_upload_normal_image_being_fetched.png) | `T1-05c` — The uploaded image rendering correctly at `/uploads/...` |
+| ![Malicious file selected](T1-05c_upload_malicious_file_selected.png) | `T1-05c` — `proof.jsp` selected in the file picker, pre-submit, no client-side restriction |
+| ![Malicious file accepted](T1-05d_upload_malicious_accepted.png) | `T1-05d` — `proof.jsp` listed under "Uploaded Files" next to the legitimate image — accepted with zero validation |
+| ![Malicious file executed](T1-05d_upload_malicious_accepted-output.png) | `T1-05d` — Navigating to `/uploads/proof.jsp` directly: Tomcat executes it, printing server info and live date — confirms RCE, not just file storage |
+| ![Vulnerable controller](T1-05g_upload_vulnerable_controller.png) | `T1-05g` — Source: `UploadController.java`, `handleUpload()` showing no extension/content-type/magic-byte validation |
+| ![Vulnerable template](T1-05h_upload_vulnerable_template.png) | `T1-05h` — Source: `upload/index.html`, plain file input with no `accept` restriction |
+
+### Planned prevention (Task 3)
+Validate uploads against a strict image allow-list checked **server-side** by actual content (e.g. `ImageIO.read()` succeeding, or magic-byte/MIME sniffing via Apache Tika) rather than the client-supplied filename or `Content-Type` header; rename every accepted file server-side to a generated UUID so the attacker never controls the stored filename or extension; move the upload directory **outside** the deployed webapp path (or disable JSP/servlet execution on that directory at the Tomcat context level); and enforce a maximum file size.
+
+---
+## 6.7 — SSRF (Link Preview)
+
+### Objective
+Demonstrate a Server-Side Request Forgery vulnerability in the Link Preview feature.
+
+### Location
+- Vulnerable code: `src/main/java/com/campusconnect/controller/LinkPreviewController.java`, `fetchPreview()`
+- Target: `src/main/java/com/campusconnect/controller/InternalAdminController.java`, `/internal/admin/status` (unlinked in the UI)
+
+### Vulnerable code
+```java
+@GetMapping("/link-preview/fetch")
+public String fetchPreview(@RequestParam String url, Model model) {
+    model.addAttribute("submittedUrl", url);
+    try {
+        String body = restTemplate.getForObject(url, String.class);
+        model.addAttribute("previewContent", body);
+    } catch (Exception e) {
+        model.addAttribute("error", e.getMessage());
+    }
+    return "linkpreview/index";
+}
+```
+
+### Why vulnerable
+`fetchPreview()` passes the user-supplied `url` parameter directly to `RestTemplate.getForObject()`
+with no allow-list of hosts/domains, no block on loopback or private IP ranges, and no restriction
+on port. The raw response body is reflected back to the requester unmodified. The application server
+itself performs the request, borrowing the server's own network position and trust — not the
+victim's browser or session.
+
+### Attack input
+`http://localhost:8080/vulnerable-webapp/internal/admin/status`
+
+### Attack procedure
+1. Confirm normal functionality: preview a real external URL, e.g. `https://example.com`.
+2. Submit the internal admin URL through the same field instead.
+3. The server fetches it server-side and reflects the response back — DB URL, DB user, and
+   an internal admin API key, from a page with no link anywhere in the application.
+
+### Expected vs. actual result
+| | |
+|---|---|
+| **Expected (secure) behaviour** | Request rejected — target host not on an allow-list, or loopback/private ranges blocked outright |
+| **Actual (vulnerable) result** | Internal admin data returned to the requester through the "preview," with no restriction on target host or port |
+
+### Security impact
+An attacker can use the application server as a proxy into its own internal surface — reaching
+endpoints, services, and ports that were never intended to be reachable from outside, purely
+because the fetch feature trusts whatever URL it's given. Beyond the one demonstrated endpoint,
+the same technique can be used to fingerprint open vs. closed ports on the host by comparing
+error messages (see optional evidence T1-06h/i), turning a "link preview" feature into an
+internal network scanner.
+
+### Evidence
+T1-06a through T1-06g (see evidence folder); T1-06h/i optional bonus evidence.
+
+### Planned prevention (Task 3)
+Validate the target URL against a strict allow-list of permitted schemes/hosts before fetching;
+explicitly reject loopback addresses (`localhost`, `127.0.0.1`, `::1`) and private IP ranges
+(`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`); resolve DNS server-side and check the resolved
+IP (not just the hostname string) against that block-list to prevent DNS-rebinding bypasses; and
+avoid reflecting the raw response body back to the requester.
+
 ## Evidence Checklist (Task 1)
 
 | ID | Vulnerability | Vulnerable code demonstrated | Attack demonstrated | Source location documented | Status |
@@ -352,6 +521,6 @@ Add a server-side ownership/role check (requested `id` must match the session's 
 | T1-01 | Stored XSS | ✅ | ✅ | ✅ | Complete |
 | T1-02 | SQL Injection | ✅ | ✅ | ✅ | Complete |
 | T1-03 | CSRF | ✅ | ✅ | ✅ | Complete |
-| T1-04 | Data Aggregation | ✅ | ✅ | ✅ | Pending |
-| T1-05 | Unrestricted File Upload | ⬜ | ⬜ | ⬜ | Pending |
-| T1-06 | SSRF (SIT738) | ⬜ | ⬜ | ⬜ | Pending |
+| T1-04 | Data Aggregation | ✅ | ✅ | ✅ | Complete |
+| T1-05 | Unrestricted File Upload | ✅ | ✅ | ✅ | Complete |
+| T1-06 | SSRF (SIT738) | ✅ | ✅ | ✅ | Complete |
